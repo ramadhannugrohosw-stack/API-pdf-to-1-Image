@@ -5,9 +5,9 @@ const multer = require("multer");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const sharp = require("sharp");
 
 const { runGhostscript, listJpgFiles } = require("./ghostscript");
-const { streamZip } = require("./zip");
 
 const app = express();
 
@@ -66,6 +66,74 @@ function safeRm(dirPath) {
   } catch {}
 }
 
+/**
+ * Gabungkan banyak JPG menjadi 1 gambar panjang (stack vertikal).
+ * - width disamakan ke max width; yang lebih kecil di-pad putih di kanan.
+ * - output JPEG buffer
+ *
+ * @param {string[]} jpgPaths
+ * @param {{jpegQuality?: number}} opt
+ * @returns {Promise<Buffer>}
+ */
+async function mergeJpgVertical(jpgPaths, opt = {}) {
+  if (!Array.isArray(jpgPaths) || jpgPaths.length === 0) {
+    throw new Error("mergeJpgVertical: jpgPaths is empty");
+  }
+
+  const jpegQuality = Math.min(Math.max(parseInt(opt.jpegQuality || "85", 10), 1), 100);
+
+  // Metadata tiap gambar
+  const metas = await Promise.all(
+    jpgPaths.map(async (p) => {
+      const img = sharp(p);
+      const meta = await img.metadata();
+      if (!meta.width || !meta.height) {
+        throw new Error(`Invalid image metadata: ${path.basename(p)}`);
+      }
+      return { path: p, width: meta.width, height: meta.height };
+    })
+  );
+
+  const maxW = Math.max(...metas.map((m) => m.width));
+  const totalH = metas.reduce((acc, m) => acc + m.height, 0);
+
+  // Siapkan komposit bertumpuk
+  let y = 0;
+  const composites = [];
+
+  for (const m of metas) {
+    let img = sharp(m.path);
+
+    // pad ke kanan bila width lebih kecil
+    if (m.width < maxW) {
+      img = img.extend({
+        top: 0,
+        bottom: 0,
+        left: 0,
+        right: maxW - m.width,
+        background: { r: 255, g: 255, b: 255, alpha: 1 },
+      });
+    }
+
+    const buf = await img.toBuffer();
+    composites.push({ input: buf, top: y, left: 0 });
+    y += m.height;
+  }
+
+  // Kanvas putih + composite + encode JPEG
+  return sharp({
+    create: {
+      width: maxW,
+      height: totalH,
+      channels: 3,
+      background: { r: 255, g: 255, b: 255 },
+    },
+  })
+    .composite(composites)
+    .jpeg({ quality: jpegQuality })
+    .toBuffer();
+}
+
 // =========================
 // Multer upload
 // =========================
@@ -89,22 +157,24 @@ const upload = multer({
 // =========================
 app.get("/", (req, res) => {
   res.type("text/plain").send(
-    `PDF→JPG API\n\n` +
+    `PDF→LONG-JPG API\n\n` +
       `POST /v1/convert/pdf-to-jpg\n` +
       `Content-Type: multipart/form-data\n` +
       `Field: file (PDF)\n\n` +
       `Optional fields:\n` +
       `- dpi (72..600)\n` +
-      `- quality (1..100)\n` +
+      `- quality (1..100)           // kualitas JPG per halaman dari Ghostscript\n` +
+      `- jpegQuality (1..100)       // kualitas JPG output gabungan\n` +
       `- firstPage (>=1)\n` +
       `- lastPage (>=firstPage)\n` +
       `- memoryMB (64..2048)\n\n` +
-      `Response: application/zip\n`
+      `Response: image/jpeg (single long image)\n`
   );
 });
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
+// SINGLE OUTPUT: image/jpeg (gabungan semua halaman)
 app.post("/v1/convert/pdf-to-jpg", upload.single("file"), async (req, res) => {
   const pdfTempPath = req.file?.path;
   if (!pdfTempPath) {
@@ -120,6 +190,8 @@ app.post("/v1/convert/pdf-to-jpg", upload.single("file"), async (req, res) => {
   // Params with sane bounds
   const dpi = Math.min(Math.max(parseInt(req.body.dpi || "150", 10), 72), 600);
   const quality = Math.min(Math.max(parseInt(req.body.quality || "85", 10), 1), 100);
+  const jpegQuality = Math.min(Math.max(parseInt(req.body.jpegQuality || "85", 10), 1), 100);
+
   const firstPage = Math.max(parseInt(req.body.firstPage || "1", 10), 1);
   const lastPage = Math.max(parseInt(req.body.lastPage || "9999", 10), firstPage);
   const memoryMB = Math.min(Math.max(parseInt(req.body.memoryMB || "300", 10), 64), 2048);
@@ -129,9 +201,9 @@ app.post("/v1/convert/pdf-to-jpg", upload.single("file"), async (req, res) => {
   const outputDir = path.join(workDir, "out");
   fs.mkdirSync(outputDir, { recursive: true });
 
-  // ZIP name dynamic (avoid overwrite; good for curl -OJ)
+  // Output name
   const safeBase = sanitizeBaseName(req.file.originalname);
-  const zipName = `${safeBase}.zip`;
+  const outName = `${safeBase}-LONG.jpg`;
 
   try {
     await runGhostscript({
@@ -150,11 +222,13 @@ app.post("/v1/convert/pdf-to-jpg", upload.single("file"), async (req, res) => {
       return res.status(422).json({ error: "No JPG generated. Invalid PDF?" });
     }
 
-    // Stream ZIP result
-    await streamZip(res, jpgs, { zipName });
+    const merged = await mergeJpgVertical(jpgs, { jpegQuality });
+
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Content-Disposition", `attachment; filename="${outName}"`);
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(merged);
   } catch (e) {
-    // Kalau response belum terkirim (belum mulai stream), kita aman kirim JSON
-    // Jika streaming sudah berjalan, error akan muncul di client sebagai koneksi terputus.
     if (!res.headersSent) {
       res.status(500).json({ error: e?.message || "convert failed" });
     }
@@ -184,7 +258,7 @@ app.use((err, req, res, next) => {
 // Start server
 // =========================
 app.listen(PORT, () => {
-  console.log(`PDF→JPG API running: http://localhost:${PORT}`);
+  console.log(`PDF→LONG-JPG API running: http://localhost:${PORT}`);
   console.log(`Platform: ${os.platform()}`);
   console.log(`MAX_UPLOAD_MB: ${MAX_MB}`);
   console.log(`GS_BIN (override): ${process.env.GS_BIN || "(not set)"}`);
